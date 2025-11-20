@@ -1,2 +1,15 @@
 # CyberscanX
-Basically a tool that checks a website for SQL injection problems. This is a mini version of real tools like OWASP ZAP, BurpSuite, and SQLMap, but built completely by ME, with a clean UI .
+
+CyberscanX is an educational SQL injection scanner with a Streamlit UI.
+
+### ⚠ Disclaimer
+This tool must be used ONLY on legal, intentionally vulnerable demo servers such as:
+- DVWA  
+- JuiceShop  
+- WebGoat  
+- Mutillidae  
+- bWAPP  
+
+Do NOT scan public websites.
+
+### ▶ How to run locally
