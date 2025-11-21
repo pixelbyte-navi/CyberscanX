@@ -1,4 +1,4 @@
-# app.py - CyberscanX (no demo simulation)
+# app.py - CyberscanX (fixed URL builder; live checks, no demo simulation)
 # Real (lightweight) SQL Injection checks for educational/demo targets only.
 # WARNING: Only scan systems you own or have explicit permission to test.
 
@@ -48,16 +48,29 @@ SQL_ERROR_PATTERNS = [
 SQL_ERROR_RE = re.compile("|".join(SQL_ERROR_PATTERNS), re.IGNORECASE)
 
 def find_query_params(url):
-    """Return dict of query params and their values."""
+    """Return dict of query params and their values (parse_qs), and parsed parts."""
     parts = urlparse(url)
     return parse_qs(parts.query), parts
 
 def build_url_with_param(parts, params, key, new_value):
-    """Return new URL with modified single parameter value (keeps other params)."""
-    # params: dict from parse_qs (values lists)
-    params_copy = {k: v[:] for k, v in params.items()}
-    params_copy[key] = [new_value]
-    new_query = urlencode({k: v[0] for k, v in params_copy}, doseq=False)
+    """
+    Return new URL with modified single parameter value (keeps other params).
+    Handles params values that may be lists or strings safely.
+    """
+    # Normalize params into a simple dict of single values
+    normalized = {}
+    for k, v in params.items():
+        if isinstance(v, list):
+            normalized[k] = v[0] if len(v) > 0 else ""
+        else:
+            # If v is a string or other type, keep it
+            normalized[k] = v
+
+    # Set the new value for the target key
+    normalized[key] = new_value
+
+    # urlencode expects a mapping of strings
+    new_query = urlencode(normalized, doseq=False)
     new_parts = parts._replace(query=new_query)
     return urlunparse(new_parts)
 
@@ -168,7 +181,9 @@ if run:
                 i = 0
                 for param_key in params.keys():
                     # original value to replace
-                    orig_val = params[param_key][0] if isinstance(params[param_key], list) and params[param_key] else params[param_key]
+                    orig_v = params[param_key]
+                    # determine a safe original string
+                    orig_val = orig_v[0] if isinstance(orig_v, list) and len(orig_v) > 0 else (str(orig_v) if orig_v is not None else "")
                     for p in PAYLOADS:
                         i += 1
                         fraction = i / max(1, total_checks)
@@ -188,8 +203,6 @@ if run:
                         # Check time-based triggers if payload type is 'time'
                         if p.get("type") == "time":
                             if elapsed_t and baseline_time is not None:
-                                # if response time significantly higher than baseline, flag it
-                                # threshold: baseline + (sleep_time * 0.6)
                                 sleep_time = p.get("sleep", 2)
                                 if elapsed_t and (elapsed_t - baseline_time) > (sleep_time * 0.6):
                                     severity = "High"
@@ -200,29 +213,23 @@ if run:
                             if text_t and detect_error_based(text_t):
                                 severity = "Medium"
                                 finding_type = "Error-based SQLi (possible)"
-                                # capture small snippet of matched text for evidence
                                 match = SQL_ERROR_RE.search(text_t)
                                 snippet = match.group(0) if match else "SQL error pattern found"
                                 evidence = f"Matched error pattern: {snippet}"
                             else:
                                 # boolean-based heuristic: compare length differences or content differences
-                                # send a control payload that should return different result and compare lengths
-                                # For boolean detection we try a payload that should change results if injectable
                                 if p.get("type") == "boolean":
-                                    # build a 'false' payload to compare (e.g., ' AND 1=2 -- )
                                     false_payload = p["payload"] + " AND 1=2 -- "
                                     false_test_url = build_url_with_param(parts, params, param_key, orig_val + false_payload)
                                     _, false_text, _ = safe_request_get(false_test_url, timeout)
                                     len_diff = 0
                                     if false_text is not None and text_t is not None:
                                         len_diff = abs(len(false_text) - len(text_t))
-                                    # if length difference is sizable (heuristic), mark low/medium
                                     if len_diff > max(30, baseline_len * 0.02):  # 2% change or 30 chars
                                         severity = "Low"
                                         finding_type = "Boolean-based difference (possible)"
                                         evidence = f"Length difference detected between payload and control: diff={len_diff} chars"
                                     else:
-                                        # sometimes boolean won't show big length change; try simple substring checks
                                         if text_t and false_text and text_t != false_text:
                                             severity = "Low"
                                             finding_type = "Boolean-based content difference (possible)"
