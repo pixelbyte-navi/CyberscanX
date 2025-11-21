@@ -1,139 +1,172 @@
-# Compact, Streamlit-ready CyberscanX app (working version)
-# Save this as app.py in your Streamlit project.
-# This version is robust: it safely loads a logo (local repo file or uploaded /mnt/data path),
-# avoids crashing if the image is missing, and uses a compact professional layout that
-# works both locally and on Streamlit Cloud.
+# CyberscanX — Professional Results Output (Streamlit)
+# Save as app.py. This version focuses on professional, resume-ready output:
+# - Clear metrics (vuln count, severity)
+# - Results table + sortable dataframe
+# - Expanders with details and example evidence
+# - CSV / JSON / HTML download buttons
+# - Clean, minimal style
 
 import streamlit as st
-from PIL import Image
+import pandas as pd
 import time
+from datetime import datetime
+import json
 import os
 
-st.set_page_config(page_title="CyberscanX — Compact", layout="centered")
+st.set_page_config(page_title="CyberscanX — Professional", layout="centered")
 
-# -----------------------
-# Helper: safe image loader
-# -----------------------
-# We include these candidates so the app works in multiple environments:
-# 1) logo.png (recommended: place this file in the same repo as app.py)
-# 2) your uploaded local file path (dev only): /mnt/data/08af1f3f-86aa-4b6a-a3d4-89f5b9a41ee4.png
-# If none exist, we'll show a text fallback (so the app never crashes).
-logo_candidates = [
-    "logo.png",  # put a logo.png next to app.py (recommended for Streamlit Cloud)
-    "/mnt/data/08af1f3f-86aa-4b6a-a3d4-89f5b9a41ee4.png",  # dev/uploaded file path
-]
-
-logo_path = None
-for p in logo_candidates:
-    if os.path.exists(p):
-        logo_path = p
-        break
-
-# -----------------------
-# Compact CSS (subtle) - safe and small
-# -----------------------
+# ---------- CSS ----------
 st.markdown(
     """
     <style>
-    :root{--page-bg:#f5f7fb}
-    html,body,#root, .block-container{background:var(--page-bg);}
-    .block-container{max-width:880px;padding-top:12px;padding-bottom:8px;padding-left:18px;padding-right:18px}
-    header {visibility: hidden}
-    .card{background:#ffffff;border-radius:10px;padding:14px;margin-bottom:12px;box-shadow:0 6px 18px rgba(15,20,30,0.06)}
+    :root{--page-bg:#f6f8fb}
+    html,body,#root, .block-container{background:var(--page-bg);} 
+    .block-container{max-width:920px;padding-top:14px;padding-bottom:14px}
+    header {visibility:hidden}
+    .card{background:#ffffff;border-radius:12px;padding:16px;margin-bottom:14px;box-shadow:0 8px 22px rgba(15,20,30,0.06)}
     .muted{color:#6b7280;font-size:13px}
-    .row{display:flex;gap:12px}
-    .col{flex:1}
-    .footer{font-size:12px;color:#8b94a6}
+    .badge{display:inline-block;padding:6px 10px;border-radius:999px;font-weight:600}
+    .high{background:#ffe9e9;color:#9f1b1b}
+    .medium{background:#fff4db;color:#8a5a00}
+    .low{background:#e8f8ff;color:#03506f}
+    .info{background:#eefaf1;color:#116529}
+    .tiny{font-size:12px;color:#9aa3b2}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# -----------------------
-# Header: simple light-color title (no logo)
-# -----------------------
-st.markdown('<div class="card" style="background:#fafcff">', unsafe_allow_html=True)
-st.markdown('<div style="font-size:22px;font-weight:700">CyberscanX — SQL Injection Scanner</div>', unsafe_allow_html=True)
-st.markdown('<div class="muted">Educational demo — use only on legal targets (DVWA, JuiceShop, WebGoat)</div>', unsafe_allow_html=True)
+# ---------- Header ----------
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.markdown('<div style="font-size:22px;font-weight:800">CyberscanX — SQL Injection Scanner</div>', unsafe_allow_html=True)
+st.markdown('<div class="muted">Professional results — use only on legal demo targets (DVWA, JuiceShop, WebGoat)</div>', unsafe_allow_html=True)
 st.markdown('</div>', unsafe_allow_html=True)
 
-# -----------------------
-with st.container():
-    st.markdown('<div class="card" style="display:flex;align-items:center;gap:14px">', unsafe_allow_html=True)
-    cols = st.columns([1,6])
-    with cols[0]:
-        if logo_path:
-            try:
-                img = Image.open(logo_path)
-                st.image(img, width=64)
-            except Exception:
-                st.markdown('<div style="font-size:22px;font-weight:700">CyberscanX — SQL Injection Scanner</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div style="font-size:22px;font-weight:700">CyberscanX — SQL Injection Scanner</div>', unsafe_allow_html=True)
-    with cols[1]:
-        st.markdown('<div style="font-size:20px;font-weight:700">CyberscanX — SQL Injection Scanner</div>', unsafe_allow_html=True)
-        st.markdown('<div class="muted">Educational demo — use only on legal targets (DVWA, JuiceShop, WebGoat)</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-# -----------------------
-# Compact input card
-# -----------------------
-with st.container():
+# ---------- Input Card ----------
+with st.form('scan_form'):
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    with st.form('scan_form'):
-        st.markdown('**Target URL (DVWA / JuiceShop demo only)**')
-        target = st.text_input('', value='http://localhost/dvwa/vulnerabilities/sqli/?id=1&Submit=Submit')
+    st.markdown('**Target URL (DVWA / JuiceShop demo only)**')
+    target = st.text_input('', value='http://localhost/dvwa/vulnerabilities/sqli/?id=1&Submit=Submit')
 
-        c1, c2 = st.columns(2)
-        with c1:
-            timeout = st.number_input('Timeout (seconds)', min_value=1, value=8, step=1)
-        with c2:
-            delay = st.number_input('Delay between requests (seconds)', min_value=0.0, value=0.2, step=0.05, format='%.2f')
+    c1, c2 = st.columns(2)
+    with c1:
+        timeout = st.number_input('Timeout (seconds)', min_value=1, value=8, step=1)
+    with c2:
+        delay = st.number_input('Delay between requests (seconds)', min_value=0.0, value=0.2, step=0.05, format='%.2f')
 
-        st.markdown('<div class="muted">This is a basic educational scanner. Do NOT scan public websites.</div>', unsafe_allow_html=True)
-
-        run = st.form_submit_button('Run Scan')
+    st.markdown('<div class="muted">This is an educational scanner. Do NOT scan public websites.</div>', unsafe_allow_html=True)
+    run = st.form_submit_button('Run Scan')
     st.markdown('</div>', unsafe_allow_html=True)
 
-# -----------------------
-# Results / progress card (won't show until Run)
-# -----------------------
-results_placeholder = st.empty()
+# ---------- Placeholder for results ----------
+results_area = st.empty()
 
+# Helper: convert findings list to dataframe and JSON
+def findings_to_df(findings):
+    if not findings:
+        return pd.DataFrame(columns=['id','timestamp','severity','type','payload','evidence','notes'])
+    df = pd.DataFrame(findings)
+    # ensure column order
+    cols = ['id','timestamp','severity','type','payload','evidence','notes']
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ''
+    return df[cols]
+
+# Severity display helper
+def severity_badge(s):
+    s_low = s.lower()
+    if s_low == 'high':
+        return '<span class="badge high">HIGH</span>'
+    if s_low == 'medium':
+        return '<span class="badge medium">MEDIUM</span>'
+    if s_low == 'low':
+        return '<span class="badge low">LOW</span>'
+    return '<span class="badge info">INFO</span>'
+
+# ---------- Run scan (simulated) ----------
 if run:
-    with results_placeholder.container():
+    # Simulate a scanning process and collect findings (replace with your logic)
+    with results_area.container():
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('**Scan progress**')
-        prog = st.progress(0)
-        stat = st.empty()
+        st.markdown('**Scan status**')
+        progress = st.progress(0)
+        status = st.empty()
 
-        # Simulate scanning steps (replace with your scanner logic)
-        steps = 18
-        found = []
+        findings = []
+        steps = 20
         for i in range(steps + 1):
-            frac = i / steps
-            prog.progress(frac)
-            stat.markdown(f'<div class="muted">Scanning payload {i} / {steps} — checking response...</div>', unsafe_allow_html=True)
-            # simulate variable wait but respect the user delay
+            pct = i/steps
+            progress.progress(pct)
+            status.markdown(f'<div class="tiny">{datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")} — Sending payload set {i}/{steps} …</div>', unsafe_allow_html=True)
             time.sleep(max(0.02, float(delay)))
 
-            # demo detection logic (fake) — replace with real checks
+            # Demo detection rules — replace with real checks
             if i in (5, 11, 16):
-                found.append({'type': 'Possible SQLi', 'payload': f"' OR '1'='1' -- {i}", 'evidence': 'server responded with SQL error'})
+                severity = 'High' if i==5 else ('Medium' if i==11 else 'Low')
+                findings.append({
+                    'id': len(findings)+1,
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'severity': severity,
+                    'type': 'Possible SQL Injection',
+                    'payload': f"' OR '1'='1' -- {i}",
+                    'evidence': 'Server returned SQL error stack trace in response body',
+                    'notes': 'Reproduce manually. Try boolean-based payloads and time-based tests.'
+                })
 
-        if found:
-            st.markdown('<div style="margin-top:10px;font-weight:600">Vulnerabilities found</div>', unsafe_allow_html=True)
-            for v in found:
-                st.markdown(f"- **{v['type']}** — `{v['payload']}` — <span class='muted'>{v['evidence']}</span>", unsafe_allow_html=True)
+        # Summary metrics
+        df = findings_to_df(findings)
+        high = (df['severity']=='High').sum() if not df.empty else 0
+        medium = (df['severity']=='Medium').sum() if not df.empty else 0
+        low = (df['severity']=='Low').sum() if not df.empty else 0
+
+        st.markdown(f"<div style='display:flex;gap:12px;align-items:center;margin-top:8px'>"+
+                    f"<div style='font-weight:700'>Results summary</div>"+
+                    f"<div class='muted' style='margin-left:8px'>Total findings: <strong>{len(df)}</strong></div>"+
+                    f"<div style='margin-left:12px'>{severity_badge('High')} <span class='tiny' style='margin-left:6px'>{high}</span></div>"+
+                    f"<div style='margin-left:6px'>{severity_badge('Medium')} <span class='tiny' style='margin-left:6px'>{medium}</span></div>"+
+                    f"<div style='margin-left:6px'>{severity_badge('Low')} <span class='tiny' style='margin-left:6px'>{low}</span></div>"+
+                    "</div>", unsafe_allow_html=True)
+
+        st.markdown('---')
+
+        # If there are findings, show table and expanders
+        if not df.empty:
+            # Show a sortable dataframe
+            st.markdown('**Findings (click a row to copy details)**')
+            st.dataframe(df[['id','timestamp','severity','type','payload']], use_container_width=True)
+
+            # Expanders with detailed view per finding
+            for _, row in df.iterrows():
+                with st.expander(f"Finding #{int(row['id'])} — {row['severity']} — {row['type']}", expanded=False):
+                    st.markdown(f"**Payload:** `{row['payload']}`")
+                    st.markdown(f"**Evidence:**")
+                    st.code(row['evidence'])
+                    st.markdown(f"**Notes:** {row['notes']}")
+                    st.download_button(label='Download finding (JSON)', data=json.dumps(row.to_dict(), indent=2), file_name=f"finding_{int(row['id'])}.json", mime='application/json')
+
+            # Download full report
+            csv = df.to_csv(index=False).encode('utf-8')
+            json_report = df.to_json(orient='records', indent=2)
+            html_report = df.to_html(index=False)
+
+            st.download_button('Download full report (CSV)', data=csv, file_name='cyberscanx_report.csv', mime='text/csv')
+            st.download_button('Download full report (JSON)', data=json_report, file_name='cyberscanx_report.json', mime='application/json')
+            st.download_button('Download full report (HTML)', data=html_report, file_name='cyberscanx_report.html', mime='text/html')
+
         else:
-            st.markdown('<div style="margin-top:10px;font-weight:600">No obvious vulnerabilities detected</div>', unsafe_allow_html=True)
+            st.markdown('<div style="font-weight:600;margin-top:8px">No obvious vulnerabilities detected</div>', unsafe_allow_html=True)
 
-        st.markdown('<div class="footer" style="margin-top:10px">Tip: Increase timeout for slow demo servers. Export feature coming soon.</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-# -----------------------
-# Bottom quick controls (non-intrusive)
-# -----------------------
+# ---------- If nothing run yet, show friendly empty state ----------
+if not run:
+    with results_area.container():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="muted">Press <strong>Run Scan</strong> to start the analysis. Results will appear here with structured details, severity levels, and downloadable reports.</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+# ---------- Footer quick actions ----------
 st.divider()
 col1, col2, col3 = st.columns([1,1,2])
 with col1:
