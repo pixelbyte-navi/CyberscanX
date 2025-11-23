@@ -1,237 +1,104 @@
-import streamlit as st
+# app.py
+# Very simple CyberscanX + SQLMap API integration
+# -----------------------------------------------
+# 1) Start SQLMap API in a separate terminal:
+#    sqlmapapi.py -s
+#
+# 2) Run this app:
+#    python app.py
+#
+# 3) Open: http://127.0.0.1:5000
+
+from flask import Flask, render_template, request
 import requests
-import urllib3
-import socket
-import ssl
 import time
-from urllib.parse import urlparse
-from datetime import datetime
-from bs4 import BeautifulSoup  # add beautifulsoup4 in requirements.txt
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+app = Flask(__name__)
 
-st.set_page_config(page_title="CyberscanX – Website Inspector", page_icon="🛡️", layout="wide")
-DEFAULT_TIMEOUT = 20
+# Change this only if your SQLMap API runs on a different host/port
+SQLMAP_API_URL = "http://127.0.0.1:8775"
 
 
-# ================= STATUS MEANING =================
-def get_status_meaning(code: int) -> str:
-    meanings = {
-        200: "OK – Request succeeded and the server returned the page correctly.",
-        301: "Moved Permanently – The requested resource has been assigned a new URL.",
-        302: "Found (Redirect) – Temporary redirect to another page.",
-        400: "Bad Request – The request was invalid or malformed.",
-        401: "Unauthorized – Login or authentication required.",
-        403: "Forbidden – Access to this resource is denied.",
-        404: "Not Found – The requested page or resource does not exist.",
-        500: "Internal Server Error – Something went wrong on the server.",
-        502: "Bad Gateway – Server received an invalid response from another server.",
-        503: "Service Unavailable – Server is overloaded or blocking automated traffic.",
-        504: "Gateway Timeout – Server took too long to respond.",
-    }
-    return meanings.get(code, "Unknown status code or no description available.")
-
-
-# ================= NETWORK FUNCTIONS =================
-def fetch_url(url: str):
+def scan_sql_injection(target_url: str):
+    """
+    Very simple wrapper around SQLMap API.
+    Returns a dict with:
+      - error: if something went wrong
+      - vulnerable: True/False
+      - issues: list of found SQLi issues (if any)
+    """
     try:
-        start = time.time()
-        resp = requests.get(url, timeout=DEFAULT_TIMEOUT, verify=False, allow_redirects=True)
-        elapsed = time.time() - start
-        return resp, elapsed, None
-    except Exception as e:
-        return None, None, str(e)
+        # 1) Create a new task
+        new_task = requests.get(f"{SQLMAP_API_URL}/task/new").json()
+        task_id = new_task.get("taskid")
 
+        if not task_id:
+            return {"error": "SQLMap: could not create task."}
 
-def get_base_url(url: str) -> str:
-    parsed = urlparse(url)
-    scheme = parsed.scheme or "http"
-    return f"{scheme}://{parsed.netloc}"
+        # 2) Start scan (basic options only to keep it simple)
+        start_scan = requests.post(
+            f"{SQLMAP_API_URL}/scan/{task_id}/start",
+            json={"url": target_url}
+        ).json()
 
+        if not start_scan.get("success"):
+            return {"error": "SQLMap: could not start scan."}
 
-def get_certificate_info(url: str):
-    parsed = urlparse(url)
-    if parsed.scheme != "https":
-        return "Not HTTPS – No SSL/TLS certificate.", None, None
+        # 3) Wait a bit for scan to run (very simple, no complex polling)
+        time.sleep(15)  # you can change to 10/20 seconds if you want
 
-    hostname = parsed.hostname
-    port = parsed.port or 443
+        # 4) Get scan data
+        scan_data = requests.get(
+            f"{SQLMAP_API_URL}/scan/{task_id}/data"
+        ).json()
 
-    try:
-        ctx = ssl.create_default_context()
-        with socket.create_connection((hostname, port), timeout=DEFAULT_TIMEOUT) as sock:
-            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
-                cert = ssock.getpeercert()
+        data_list = scan_data.get("data", [])
 
-        not_after = cert.get("notAfter")
-        if not not_after:
-            return "Certificate present – expiry date not available.", None, None
+        # No data = no SQLi found (or scan still running)
+        if not data_list:
+            return {
+                "vulnerable": False,
+                "message": "No SQL injection detected (or scan not finished)."
+            }
 
-        exp_date = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-        days_left = (exp_date - datetime.utcnow()).days
-        msg = f"Valid until {exp_date} (UTC) — {days_left} day(s) remaining."
-        return msg, days_left, None
+        # SQLMap returns a list; each entry has 'value' with details
+        issues = []
+        for entry in data_list:
+            value = entry.get("value", {})
+            issues.append({
+                "parameter": value.get("parameter"),
+                "type": value.get("type"),
+                "dbms": value.get("dbms"),
+                "title": value.get("title"),
+                "payload": value.get("payload"),
+            })
+
+        return {
+            "vulnerable": True,
+            "issues": issues
+        }
 
     except Exception as e:
-        return None, None, str(e)
+        return {"error": f"SQLMap API error: {e}"}
 
 
-IMPORTANT_HEADERS = [
-    "Content-Security-Policy",
-    "X-Frame-Options",
-    "X-Content-Type-Options",
-    "Strict-Transport-Security",
-    "Referrer-Policy",
-]
+@app.route("/", methods=["GET", "POST"])
+def index():
+    scan_result = None
+    url = None
 
-SENSITIVE_PATHS = [
-    "/robots.txt",
-    "/sitemap.xml",
-    "/.env",
-    "/.git/config",
-    "/backup.zip",
-    "/db.sql",
-    "/backup.sql",
-]
+    if request.method == "POST":
+        url = request.form.get("url", "").strip()
 
-
-def check_sensitive_paths(base_url: str):
-    found = []
-    for path in SENSITIVE_PATHS:
-        url = base_url.rstrip("/") + path
-        try:
-            resp = requests.get(url, timeout=DEFAULT_TIMEOUT, verify=False)
-            if resp.status_code < 400 and len(resp.text) > 0:
-                found.append((path, resp.status_code))
-        except Exception:
-            continue
-    return found
-
-
-def analyse_cookies(resp: requests.Response):
-    set_cookie_hdr = resp.headers.get("Set-Cookie")
-    if not set_cookie_hdr:
-        return []
-
-    cookies_list = []
-    parts = set_cookie_hdr.split(", ")
-    for part in parts:
-        segments = [s.strip() for s in part.split(";")]
-        name_val = segments[0].split("=", 1)
-        if len(name_val) == 2:
-            name, value = name_val
+        if url:
+            # Call our simple SQLMap wrapper
+            scan_result = scan_sql_injection(url)
         else:
-            name, value = name_val[0], ""
+            scan_result = {"error": "Please enter a URL."}
 
-        flags = [s.lower() for s in segments[1:]]
-
-        cookies_list.append({
-            "Name": name,
-            "Length": len(value),
-            "Secure": "Yes" if "secure" in flags else "No",
-            "HttpOnly": "Yes" if "httponly" in flags else "No",
-            "SameSite": next((s.split("=")[1] for s in segments if s.lower().startswith("samesite=")), "Not set"),
-        })
-    return cookies_list
+    # Render one template for both GET and POST
+    return render_template("index.html", url=url, scan_result=scan_result)
 
 
-def detect_login(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    return soup.find("input", {"type": "password"}) is not None
-
-
-# ================= UI START =================
-
-st.title("🛡 CyberscanX – Website Inspector")
-st.caption("Factual Web Analysis Tool — No guessing. No false claims. Only real observations.")
-
-mode = st.sidebar.selectbox("Mode", ["Website Inspection", "About"])
-
-
-# ================= MAIN ANALYZER =================
-if mode == "Website Inspection":
-    url = st.text_input("Enter Website URL", placeholder="https://example.com")
-
-    if st.button("Start Analysis"):
-        if not url:
-            st.error("Please enter a valid URL.")
-        else:
-            with st.spinner("Fetching webpage..."):
-                resp, elapsed, error = fetch_url(url)
-
-            if resp is None:
-                st.error(f"Error fetching URL: {error}")
-            else:
-                html = resp.text
-                base = get_base_url(url)
-
-                st.subheader("1. Basic Info")
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    st.metric("HTTP Status", resp.status_code)
-                with c2:
-                    st.metric("Time (s)", f"{elapsed:.2f}")
-                with c3:
-                    st.metric("Size (bytes)", len(html))
-
-                st.write("Meaning:", get_status_meaning(resp.status_code))
-                st.write("Server:", resp.headers.get("Server", "Not provided"))
-                st.write("X-Powered-By:", resp.headers.get("X-Powered-By", "Not provided"))
-
-                st.subheader("2. HTTPS Certificate")
-                cert_summary, cert_days, cert_err = get_certificate_info(url)
-                if cert_err:
-                    st.warning(f"Could not inspect certificate: {cert_err}")
-                else:
-                    st.info(cert_summary)
-
-                st.subheader("3. Important Security Headers")
-                headers_data = []
-                for h in IMPORTANT_HEADERS:
-                    val = resp.headers.get(h)
-                    headers_data.append({"Header": h, "Present": "Yes" if val else "No", "Value": val or "-"})
-                st.table(headers_data)
-
-                st.subheader("4. Cookies")
-                cookies = analyse_cookies(resp)
-                if cookies:
-                    st.table(cookies)
-                else:
-                    st.write("No cookie headers detected.")
-
-                st.subheader("5. Login Form Detection")
-                if detect_login(html):
-                    st.info("Password field detected — login page exists.")
-                else:
-                    st.write("No password field detected.")
-
-                st.subheader("6. Sensitive File Discovery")
-                found = check_sensitive_paths(base)
-                if found:
-                    st.error("Potential exposed files discovered:")
-                    st.table(found)
-                else:
-                    st.success("No common sensitive files accessible.")
-
-                st.markdown("---")
-                st.caption("This tool only performs read-only observation. No active attack or exploitation carried out.")
-
-
-# ================= ABOUT SECTION =================
-else:
-    st.subheader("About CyberscanX – Website Inspector")
-    st.write("""
-    This tool performs factual, external web analysis to help developers understand what their site exposes
-    over HTTP. It does not guess technologies or produce fake risk scores.
-    
-    **Outputs include:**
-    - HTTP Status meaning
-    - HTTPS Certificate expiry
-    - Security Headers presence
-    - Cookie security flags (Secure, HttpOnly, SameSite)
-    - Login form detection
-    - Exposed sensitive path check
-
-    **Developer:** Lord Naveen 😎
-    """)
-
+if __name__ == "__main__":
+    app.run(debug=True)
