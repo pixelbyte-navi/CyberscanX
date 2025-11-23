@@ -1,377 +1,409 @@
 import streamlit as st
 import requests
-import time
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import urllib3
+import socket
+import ssl
+import time
+from urllib.parse import urlparse
+from datetime import datetime
+from bs4 import BeautifulSoup  # make sure beautifulsoup4 is in requirements.txt
 
-# Disable SSL warnings because we use verify=False for demo/testing
+# ----- Basic setup -----
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ---------- Global Settings ----------
 st.set_page_config(page_title="CyberscanX", page_icon="🛡️", layout="wide")
-DEFAULT_TIMEOUT = 25  # internal timeout in seconds
+DEFAULT_TIMEOUT = 20  # seconds
 
-# ---------- SQLi Payloads & Error Keywords ----------
-SQLI_PAYLOADS = [
-    "1' OR '1'='1",
-    "1'--",
-    "1 OR 1=1",
-    "1');--",
-]
 
-ERROR_KEYWORDS = [
-    "sql syntax",
-    "mysql",
-    "mysqli",
-    "odbc",
-    "pdoexception",
-    "unclosed quotation",
-    "syntax error",
-    "warning: mysql",
-    "native client",
-]
+# ================= Helper functions =================
 
-# ---------- Helper Functions ----------
-
-def get_params(url: str):
-    """Extract query parameter names from a URL."""
+def get_base_url(url: str) -> str:
     parsed = urlparse(url)
-    return list(parse_qs(parsed.query, keep_blank_values=True).keys())
+    scheme = parsed.scheme or "http"
+    netloc = parsed.netloc
+    return f"{scheme}://{netloc}"
 
 
-def build_url(original_url: str, param_name: str, value: str) -> str:
-    """Return a new URL with one query parameter changed to a new value."""
-    parsed = urlparse(original_url)
-    query = parse_qs(parsed.query, keep_blank_values=True)
-    query[param_name] = [value]
-    new_query = urlencode(query, doseq=True)
-    new_parsed = parsed._replace(query=new_query)
-    return urlunparse(new_parsed)
-
-
-def send_request(target: str):
-    """Send a GET request with fixed timeout and SSL verification disabled."""
+def fetch_url(url: str):
     try:
         start = time.time()
-        resp = requests.get(target, timeout=DEFAULT_TIMEOUT, verify=False)
+        resp = requests.get(url, timeout=DEFAULT_TIMEOUT, verify=False)
         elapsed = time.time() - start
         return resp, elapsed, None
     except Exception as e:
         return None, None, str(e)
 
 
-def calculate_header_risk(headers: dict, status_code: int, set_cookie_header: str):
-    """
-    Very simple rule-based risk scoring for interview/demo.
-    Returns (risk_level, score, issues_list).
-    """
+def detect_static_dynamic(html: str, resp: requests.Response) -> str:
+    """Very simple heuristic: NOT perfect, but good for explanation."""
+    if resp.cookies:
+        return "Likely Dynamic (cookies used)"
+    soup = BeautifulSoup(html, "html.parser")
+    forms = soup.find_all("form")
+    if any(f.get("method", "").lower() == "post" for f in forms):
+        return "Dynamic (POST form detected)"
+    text = html.lower()
+    hints = ["fetch(", "axios", "xmlhttprequest", "/api/"]
+    if any(h in text for h in hints):
+        return "Likely Dynamic (JS/API calls detected)"
+    return "Likely Static (no obvious dynamic features found)"
+
+
+def detect_stack_and_framework(html: str, resp: requests.Response):
+    """Return (backend_guess, framework_guess, notes_list)."""
+    backend = "Unknown"
+    framework = "Unknown"
+    notes = []
+
+    server = resp.headers.get("Server", "")
+    powered = resp.headers.get("X-Powered-By", "")
+    html_lower = html.lower()
+
+    # Backend guesses
+    if "php" in powered.lower() or ".php" in html_lower or "php" in server.lower():
+        backend = "PHP (heuristic)"
+    elif "asp.net" in powered.lower() or "asp.net" in server.lower():
+        backend = ".NET (ASP.NET) (heuristic)"
+    elif "nginx" in server.lower():
+        backend = "Possibly PHP/Node (behind Nginx)"
+    elif "apache" in server.lower():
+        backend = "Possibly PHP/Perl (Apache)"
+    elif "python" in powered.lower() or "wsgi" in server.lower():
+        backend = "Python (Django/Flask) (heuristic)"
+    elif "node" in powered.lower() or "express" in html_lower:
+        backend = "Node.js (heuristic)"
+
+    # Framework detection (very rough)
+    if "wp-content" in html_lower or "wp-includes" in html_lower:
+        framework = "WordPress"
+    elif "__next" in html_lower:
+        framework = "Next.js (React SSR)"
+    elif 'id="root"' in html_lower or 'id="app"' in html_lower:
+        framework = "SPA (React/Vue/Angular - heuristic)"
+    elif "csrfmiddlewaretoken" in html_lower:
+        framework = "Django"
+    elif "laravel" in html_lower:
+        framework = "Laravel (heuristic)"
+
+    if powered:
+        notes.append(f"X-Powered-By header: {powered}")
+    if server:
+        notes.append(f"Server header: {server}")
+
+    return backend, framework, notes
+
+
+def get_certificate_info(url: str):
+    """Return (summary_str, days_to_expiry or None, error_str or None)."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return "Not an HTTPS URL – no certificate.", None, None
+
+    hostname = parsed.hostname
+    port = parsed.port or 443
+
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((hostname, port), timeout=DEFAULT_TIMEOUT) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert = ssock.getpeercert()
+        not_after = cert.get("notAfter")
+        if not not_after:
+            return "Certificate information not available.", None, None
+
+        # Example format: 'Jan 15 12:00:00 2026 GMT'
+        exp = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+        days_left = (exp - datetime.utcnow()).days
+        summary = f"Certificate valid until {exp} (UTC), ~{days_left} day(s) remaining."
+        return summary, days_left, None
+    except Exception as e:
+        return None, None, str(e)
+
+
+def analyse_cookies(resp: requests.Response):
+    """Return (issues_list, summary_str)."""
+    cookies = resp.cookies
+    set_cookie_hdr = resp.headers.get("Set-Cookie", "")
     issues = []
 
-    csp = headers.get("Content-Security-Policy")
-    xfo = headers.get("X-Frame-Options")
-    xcto = headers.get("X-Content-Type-Options")
-    hsts = headers.get("Strict-Transport-Security")
-    refpol = headers.get("Referrer-Policy")
+    if not cookies and not set_cookie_hdr:
+        return ["No cookies observed in this response."], "No session/cookie behaviour visible."
 
-    score = 0
+    # Check raw Set-Cookie header once for flags
+    summary = "Analysed cookie flags from Set-Cookie header."
+    sc_lower = set_cookie_hdr.lower()
 
-    # Missing important headers
-    if not csp:
-        score += 3
-        issues.append("Content-Security-Policy header is missing (helps prevent XSS).")
-    if not xfo:
-        score += 2
-        issues.append("X-Frame-Options header is missing (helps prevent clickjacking).")
-    if not xcto:
-        score += 2
-        issues.append("X-Content-Type-Options header is missing (helps prevent MIME sniffing).")
-    if not hsts:
-        score += 2
-        issues.append("Strict-Transport-Security header is missing (enforces HTTPS).")
-    if not refpol:
-        score += 1
-        issues.append("Referrer-Policy header is missing (controls info leakage in referer).")
-
-    # Check cookie security flags in Set-Cookie header (very rough)
-    cookie_info = ""
-    if set_cookie_header:
-        sc_lower = set_cookie_header.lower()
-        if "secure" not in sc_lower:
-            score += 1
-            issues.append("Some cookies may be missing the Secure flag.")
-        if "httponly" not in sc_lower:
-            score += 1
-            issues.append("Some cookies may be missing the HttpOnly flag.")
-        if "samesite" not in sc_lower:
-            issues.append("SameSite attribute not visible for cookies (CSRF protection).")
-        cookie_info = "Cookie security flags analysed."
-    else:
-        cookie_info = "No Set-Cookie header observed in this response."
-
-    # HTTP status influence
-    if status_code >= 500:
-        score += 1
-        issues.append("Server returned 5xx error for this request (may be an error page or protection layer).")
-
-    # Determine risk level from score (just for education, not real-world guarantee)
-    if score >= 7:
-        risk = "High"
-    elif score >= 4:
-        risk = "Medium"
-    else:
-        risk = "Low"
+    if "secure" not in sc_lower:
+        issues.append("Some cookies may be missing the Secure flag (should be sent only over HTTPS).")
+    if "httponly" not in sc_lower:
+        issues.append("Some cookies may be missing the HttpOnly flag (protects against cookie theft via XSS).")
+    if "samesite" not in sc_lower:
+        issues.append("SameSite attribute not clearly set (helps against CSRF).")
 
     if not issues:
-        issues.append("No major missing security headers detected in this response.")
+        issues.append("All main cookie security flags (Secure, HttpOnly, SameSite) appear to be set.")
 
-    return risk, score, issues, cookie_info
+    return issues, summary
 
 
-# ---------- Sidebar & Title ----------
-st.title("🛡️ CyberscanX")
+SENSITIVE_PATHS = [
+    "/robots.txt",
+    "/sitemap.xml",
+    "/.env",
+    "/.git/config",
+    "/backup.zip",
+    "/db.sql",
+    "/backup.sql",
+    "/config.php.bak",
+    "/.DS_Store",
+]
+
+
+def check_sensitive_paths(base_url: str):
+    found = []
+    for path in SENSITIVE_PATHS:
+        url = base_url.rstrip("/") + path
+        try:
+            resp = requests.get(url, timeout=DEFAULT_TIMEOUT, verify=False, allow_redirects=True)
+            if resp.status_code < 400 and len(resp.text) > 0:
+                found.append((path, resp.status_code))
+        except Exception:
+            continue
+    return found
+
+
+def detect_login_form(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    forms = soup.find_all("form")
+    for f in forms:
+        inputs = f.find_all("input")
+        for i in inputs:
+            t = (i.get("type") or "").lower()
+            name = (i.get("name") or "").lower()
+            if "password" in t or "password" in name:
+                return True
+    return False
+
+
+# Simple risk scoring based on findings
+def build_risk_summary(
+    status_code: int,
+    cert_days: int | None,
+    sensitive_files,
+    cookie_issues,
+    static_dynamic_label: str,
+) -> tuple[str, int]:
+    """
+    Return (risk_level, score).
+    Higher score = worse. This is just for education.
+    """
+    score = 0
+
+    if status_code >= 500:
+        score += 2
+    elif status_code >= 400:
+        score += 1
+
+    if cert_days is not None:
+        if cert_days < 0:
+            score += 3
+        elif cert_days < 30:
+            score += 1
+
+    if sensitive_files:
+        score += 3
+
+    # If cookie_issues mention missing Secure/HttpOnly, add points
+    for issue in cookie_issues:
+        if "Secure flag" in issue or "HttpOnly" in issue:
+            score += 1
+
+    if "Dynamic" in static_dynamic_label:
+        score += 1  # dynamic apps naturally more complex / risky
+
+    # Convert score → label
+    if score >= 7:
+        level = "High"
+    elif score >= 4:
+        level = "Medium"
+    else:
+        level = "Low"
+
+    return level, score
+
+
+# ===================== UI =====================
+
+st.title("🛡️ CyberscanX 2.0 — Web Security Analyzer")
 st.caption(
-    "SQL Sentinel : Automated SQL Injection & Vulnerability Finder — "
-    "For legal testing & educational use only."
+    "SQL Sentinel Project • CyberscanX focuses on high-level, non-destructive web security checks. "
+    "Use only on sites you own or have permission to test."
 )
 
 mode = st.sidebar.selectbox(
-    "Select Scan Mode",
-    ["SQL Injection Scan", "Security Headers & Risk Summary", "About Project"],
+    "Select Mode",
+    ["Web Security Analyzer", "About Project"],
 )
 
-# =========================================================
-#                  SQL INJECTION SCAN
-# =========================================================
-if mode == "SQL Injection Scan":
-    st.subheader("SQL Injection Detection")
-
-    url = st.text_input(
-        "Enter target URL with parameter",
-        placeholder="https://example.com/product.php?id=1",
-    )
-
-    st.markdown(
-        "_Example:_ `https://example.com/item.php?id=1` → `id` is the parameter."
-    )
-
-    if st.button("Start SQL Injection Scan"):
-        if not url:
-            st.error("Please enter a valid URL.")
-        else:
-            params = get_params(url)
-
-            if not params:
-                st.warning("❗ No parameters found in the URL. SQL Injection Scan is NOT applicable.")
-                st.info("Hint: Add something like `?id=1` at the end of the URL to test.")
-            else:
-                param = params[0]  # testing first parameter by default
-                st.info(f"Target parameter detected: **{param}**")
-
-                # Baseline request
-                with st.spinner("Sending baseline request..."):
-                    baseline_resp, baseline_time, err = send_request(url)
-
-                if baseline_resp is None:
-                    st.error(f"Request failed: {err}")
-                else:
-                    baseline_len = len(baseline_resp.text)
-                    st.success(
-                        f"Baseline response: HTTP {baseline_resp.status_code} | "
-                        f"Time: {baseline_time:.2f}s | Size: {baseline_len} bytes"
-                    )
-
-                    results = []
-                    suspicious_count = 0
-
-                    for payload in SQLI_PAYLOADS:
-                        attack_url = build_url(url, param, payload)
-
-                        with st.spinner(f"Testing payload: `{payload}`"):
-                            resp, elapsed, error = send_request(attack_url)
-
-                        if resp is None:
-                            results.append(
-                                {
-                                    "Payload": payload,
-                                    "HTTP Status": "Request Failed",
-                                    "Suspicious": "N/A",
-                                    "Indicators": error or "No response",
-                                }
-                            )
-                            continue
-
-                        suspicious = False
-                        reasons = []
-
-                        # Response length difference
-                        length_diff = abs(len(resp.text) - baseline_len)
-                        if length_diff > 100:
-                            suspicious = True
-                            reasons.append(f"Response size changed by {length_diff} bytes.")
-
-                        # SQL error keywords
-                        body_lower = resp.text.lower()
-                        if any(keyword in body_lower for keyword in ERROR_KEYWORDS):
-                            suspicious = True
-                            reasons.append("SQL error-like keyword found in response.")
-
-                        if suspicious:
-                            suspicious_count += 1
-
-                        results.append(
-                            {
-                                "Payload": payload,
-                                "HTTP Status": resp.status_code,
-                                "Suspicious": "YES" if suspicious else "NO",
-                                "Indicators": " ".join(reasons) if reasons else "No strong indicators.",
-                            }
-                        )
-
-                    st.subheader("SQL Injection Scan Results")
-                    st.table(results)
-
-                    # Simple risk summary
-                    if suspicious_count > 0:
-                        st.error(
-                            f"🚨 Potential SQL Injection indicators detected for {suspicious_count} payload(s).\n\n"
-                            "This does NOT confirm a full exploit, but strongly suggests that the "
-                            "input handling should be reviewed and parameterized queries / prepared "
-                            "statements should be used."
-                        )
-                        st.markdown(
-                            "- Map to **OWASP Top 10: A03:2021 – Injection**  \n"
-                            "- Recommended actions: input validation, prepared statements, ORM usage, "
-                            "and disabling verbose error messages."
-                        )
-                    else:
-                        st.success(
-                            "✅ Scan completed. No strong SQL Injection indicators were observed "
-                            "for the tested parameter based on these non-destructive checks."
-                        )
-                        st.markdown(
-                            "_Note: Absence of indicators in this test does not guarantee complete security. "
-                            "Manual code review and deeper testing are still recommended in real-world audits._"
-                        )
-
-# =========================================================
-#          SECURITY HEADERS & RISK SUMMARY
-# =========================================================
-elif mode == "Security Headers & Risk Summary":
-    st.subheader("Security Headers & Risk Summary")
+# -------------------------------------------------
+#                   ANALYZER
+# -------------------------------------------------
+if mode == "Web Security Analyzer":
+    st.subheader("Web Technology & Security Overview")
 
     url = st.text_input(
         "Enter website URL",
         placeholder="https://example.com",
     )
 
-    if st.button("Analyse Security Headers"):
+    if st.button("Run Analysis"):
         if not url:
-            st.error("Please enter a valid URL.")
+            st.error("Please enter a URL.")
         else:
-            with st.spinner("Contacting target and fetching headers..."):
-                try:
-                    resp, elapsed, error = send_request(url)
-                except Exception as e:
-                    resp, elapsed, error = None, None, str(e)
+            with st.spinner("Contacting target and fetching response..."):
+                resp, elapsed, error = fetch_url(url)
 
             if resp is None:
-                st.error(f"Error while connecting to the target: {error}")
+                st.error(f"Error while fetching the URL: {error}")
             else:
-                st.success(f"Response received: HTTP {resp.status_code} in {elapsed:.2f}s")
+                html = resp.text
+                base_url = get_base_url(url)
 
-                content_length = len(resp.text)
+                # ---- Basic info ----
+                st.success(f"Response received: HTTP {resp.status_code} in {elapsed:.2f} seconds")
+                content_len = len(html)
                 server = resp.headers.get("Server", "Unknown")
                 x_powered_by = resp.headers.get("X-Powered-By", "Unknown")
-                set_cookie_header = resp.headers.get("Set-Cookie", "")
 
-                col1, col2, col3 = st.columns(3)
-                with col1:
+                c1, c2, c3 = st.columns(3)
+                with c1:
                     st.metric("HTTP Status", resp.status_code)
-                with col2:
+                with c2:
                     st.metric("Response Time (s)", f"{elapsed:.2f}")
-                with col3:
-                    st.metric("Content Size (bytes)", content_length)
+                with c3:
+                    st.metric("Content Size (bytes)", content_len)
 
-                st.write(f"**Server:** {server}")
+                st.write(f"**Server header:** {server}")
                 st.write(f"**X-Powered-By:** {x_powered_by}")
 
-                # Important headers
-                important_headers = [
-                    "Content-Security-Policy",
-                    "X-Frame-Options",
-                    "X-Content-Type-Options",
-                    "Strict-Transport-Security",
-                    "Referrer-Policy",
-                ]
+                # ---- Static vs Dynamic ----
+                sd_label = detect_static_dynamic(html, resp)
+                st.subheader("Application Nature")
+                st.info(f"Based on simple heuristics, this site appears: **{sd_label}**.")
 
-                header_rows = []
-                header_map = {}
-                for h in important_headers:
-                    val = resp.headers.get(h)
-                    status = "Present" if val else "Missing"
-                    header_rows.append(
-                        {
-                            "Header": h,
-                            "Status": status,
-                            "Value": val if val else "-",
-                        }
-                    )
-                    header_map[h] = val
+                # ---- Stack & Framework ----
+                backend, framework, tech_notes = detect_stack_and_framework(html, resp)
+                st.subheader("Technology Fingerprint (Heuristic)")
+                st.write(f"**Probable backend stack:** {backend}")
+                st.write(f"**Probable framework/CMS:** {framework}")
+                if tech_notes:
+                    st.markdown("**Evidence:**")
+                    for n in tech_notes:
+                        st.markdown(f"- {n}")
 
-                # Calculate simple risk
-                risk_level, risk_score, issues, cookie_info = calculate_header_risk(
-                    header_map, resp.status_code, set_cookie_header
+                # ---- Certificate info ----
+                st.subheader("HTTPS Certificate Check")
+                cert_summary, days_left, cert_err = get_certificate_info(url)
+                if cert_err:
+                    st.warning(f"Could not analyse certificate: {cert_err}")
+                else:
+                    st.write(cert_summary)
+
+                # ---- Cookies / Session ----
+                st.subheader("Cookie & Session Security (from this response)")
+                cookie_issues, cookie_summary = analyse_cookies(resp)
+                st.markdown(f"*{cookie_summary}*")
+                for issue in cookie_issues:
+                    st.markdown(f"- {issue}")
+
+                # ---- Login form detection ----
+                st.subheader("Authentication Surface")
+                if detect_login_form(html):
+                    st.info("Login/Password form detected on this page (or a related form).")
+                else:
+                    st.write("No obvious login/password form detected in this specific response.")
+
+                # ---- Sensitive paths / files ----
+                st.subheader("Exposed Files & Discovery")
+                with st.spinner("Checking for robots.txt, sitemap.xml and common sensitive files..."):
+                    sensitive_found = check_sensitive_paths(base_url)
+
+                if sensitive_found:
+                    st.error("Potentially interesting/exposed paths were found:")
+                    data = []
+                    for path, status in sensitive_found:
+                        if path in ["/robots.txt", "/sitemap.xml"]:
+                            impact = "Informational — may reveal hidden URLs."
+                        else:
+                            impact = "High — file may expose configuration, backups or source code."
+                        data.append(
+                            {
+                                "Path": path,
+                                "HTTP Status": status,
+                                "Impact": impact,
+                            }
+                        )
+                    st.table(data)
+                else:
+                    st.success("No common sensitive files (from the small wordlist) were directly accessible.")
+
+                # ---- Overall risk summary ----
+                risk_level, risk_score = build_risk_summary(
+                    resp.status_code,
+                    days_left,
+                    sensitive_found,
+                    cookie_issues,
+                    sd_label,
                 )
 
-                st.subheader("Overall Security Risk Summary")
-                st.info(cookie_info)
-
-                col_r1, col_r2 = st.columns(2)
-                with col_r1:
+                st.subheader("Overall Risk Summary (Heuristic, for learning only)")
+                colr1, colr2 = st.columns(2)
+                with colr1:
                     st.metric("Calculated Risk Level", risk_level)
-                with col_r2:
+                with colr2:
                     st.metric("Risk Score (0 = best)", risk_score)
 
-                st.markdown("**Key Observations:**")
-                for item in issues:
-                    st.markdown(f"- {item}")
-
-                st.subheader("Detailed Security Header View")
-                st.table(header_rows)
-
                 st.markdown(
-                    "_This risk level is a simple educational estimate based only on HTTP response "
-                    "headers and cookie flags. Real-world security posture depends on many additional "
-                    "factors such as authentication, code quality, server hardening, and network controls._"
+                    "_This risk level is a simple, rule-based estimate for educational purposes only. "
+                    "Real security assessments require deeper authenticated testing, code review and "
+                    "context about how the application is used._"
                 )
 
-# =========================================================
-#                        ABOUT
-# =========================================================
+# -------------------------------------------------
+#                   ABOUT
+# -------------------------------------------------
 else:
-    st.subheader("About SQL Sentinel / CyberscanX")
+    st.subheader("About SQL Sentinel / CyberscanX 2.0")
     st.markdown(
         """
-        **SQL Sentinel** is the mini-project title, and **CyberscanX** is the web-based tool
-        developed under this project.
+        **Project Title:** SQL Sentinel : An Automated SQL Injection & Vulnerability Finder  
+        **Tool Name:** CyberscanX 2.0 — Web Security Analyzer  
 
-        ### What CyberscanX Does
-        - Performs **automated SQL Injection indicator testing** on URLs with parameters.  
-        - Analyses **HTTP response headers** and **cookie flags** to highlight missing
-          security controls.  
-        - Calculates a simple **Security Risk Level (High / Medium / Low)** for educational
-          understanding and quick reporting.
+        ### What this tool does
+        - Analyses a given web URL and gathers:
+          - HTTP status, response time and content size  
+          - Static vs Dynamic behaviour (heuristic)  
+          - Probable backend stack (PHP, .NET, Python, Node, etc.) and framework (WordPress, Next.js, etc.)  
+          - HTTPS certificate validity and days remaining  
+          - Cookie and session security flags (Secure, HttpOnly, SameSite)  
+          - Presence of login/password forms  
+          - Exposure of common files like `robots.txt`, `sitemap.xml`, `.env`, `.git/config`, `backup.sql`, etc.  
 
-        ### Why it is useful for interviews & placements
-        - Shows that you understand **OWASP Top 10 (Injection, Security Misconfiguration)**.  
-        - Demonstrates ability to build a **real web security tool** using Python & Streamlit.  
-        - Generates **clear, visual results** (tables, metrics, risk levels) that can be shown
-          in demos and PPTs.
+        - Produces a **simple Risk Level (Low / Medium / High)** and explanation
+          that helps developers understand **what to fix and why**.
 
-        ### Legal Disclaimer
-        - Use CyberscanX **only** on websites you own or have explicit permission to test.  
-        - The tool is intentionally **lightweight and non-destructive**, designed for labs,
-          demos, and learning.
+        ### Why this is useful
+        - Gives **web developers and students** a quick, non-destructive overview of
+          how their application looks from an attacker’s perspective.  
+        - Helps during **interviews & placements** to demonstrate:
+          - Understanding of web security concepts  
+          - Ability to build practical tools using Python & Streamlit  
+          - Awareness of limitations and ethical boundaries in security testing  
+
+        ### Legal & Ethical Note
+        - CyberscanX 2.0 performs only **read-only, non-destructive checks**.  
+        - It must be used **only on websites you own or have explicit permission to test**.  
+        - Unauthorized scanning may be illegal under computer misuse laws.
 
         **Developer:** Lord Naveen 😎  
         """
