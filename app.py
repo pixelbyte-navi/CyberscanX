@@ -2,10 +2,17 @@ import streamlit as st
 import requests
 import time
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import urllib3
 
+# Disable SSL warnings for demo purposes (because we use verify=False)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ---------- Global Settings ----------
 st.set_page_config(page_title="CyberscanX", page_icon="🛡️", layout="wide")
 
-# -------- SQL PAYLOADS ----------
+DEFAULT_TIMEOUT = 25  # internal timeout in seconds (no user control)
+
+# ---------- SQLi Payloads & Error Keywords ----------
 SQLI_PAYLOADS = [
     "1' OR '1'='1",
     "1'--",
@@ -20,154 +27,236 @@ ERROR_KEYWORDS = [
     "odbc",
     "pdoexception",
     "unclosed quotation",
-    "warning",
     "syntax error",
+    "warning: mysql",
+    "native client",
 ]
 
-# ------- Helper Functions -------
 
-def get_params(url):
+# ---------- Helper Functions ----------
+
+def get_params(url: str):
+    """Extract query parameter names from a URL."""
     parsed = urlparse(url)
-    return list(parse_qs(parsed.query).keys())
+    return list(parse_qs(parsed.query, keep_blank_values=True).keys())
 
-def build_url(original_url, param_name, value):
+
+def build_url(original_url: str, param_name: str, value: str) -> str:
+    """Return a new URL with one query parameter changed to a new value."""
     parsed = urlparse(original_url)
-    query = parse_qs(parsed.query)
-    query[param_name] = value
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query[param_name] = [value]
     new_query = urlencode(query, doseq=True)
-    parsed = parsed._replace(query=new_query)
-    return urlunparse(parsed)
+    new_parsed = parsed._replace(query=new_query)
+    return urlunparse(new_parsed)
 
-def send_request(target, timeout):
+
+def send_request(target: str):
+    """Send a GET request with fixed timeout and SSL verification disabled."""
     try:
         start = time.time()
-        resp = requests.get(target, timeout=timeout, verify=False)
-        return resp, time.time() - start, None
+        resp = requests.get(target, timeout=DEFAULT_TIMEOUT, verify=False)
+        elapsed = time.time() - start
+        return resp, elapsed, None
     except Exception as e:
         return None, None, str(e)
 
 
-# ------------ UI Layout -----------
+# ---------- Sidebar & Title ----------
+
 st.title("🛡️ CyberscanX")
-st.caption("SQL Sentinel : Automated SQL Injection & Vulnerability Finder\nFor legal testing & educational use only.")
+st.caption(
+    "SQL Sentinel : Automated SQL Injection & Vulnerability Finder "
+    "— For legal testing & educational use only."
+)
 
-mode = st.sidebar.selectbox("Select Scan Mode", ["SQL Injection Scan", "Security Header Scan", "About Project"])
+mode = st.sidebar.selectbox(
+    "Select Scan Mode",
+    ["SQL Injection Scan", "Security Header Scan", "About Project"],
+)
 
-# =============================================
-# =============== SQL Injection Scan ===========
-# =============================================
+# =========================================================
+#                  SQL INJECTION SCAN
+# =========================================================
 
 if mode == "SQL Injection Scan":
-
     st.subheader("SQL Injection Detection")
 
-    url = st.text_input("Enter target URL with parameter (example: https://testphp.vulnweb.com/artists.php?artist=1)",
-                        placeholder="https://example.com/product.php?id=1")
+    url = st.text_input(
+        "Enter target URL with parameter",
+        placeholder="https://example.com/product.php?id=1",
+    )
 
-    timeout = st.number_input("Timeout (seconds)", min_value=2, max_value=30, value=8)
+    st.markdown(
+        "_Example of parameter:_ `https://example.com/item.php?id=1` → `id` is the parameter."
+    )
 
     if st.button("Start Scan"):
-
         if not url:
-            st.error("Please enter a valid URL")
+            st.error("Please enter a valid URL.")
         else:
             params = get_params(url)
 
             if not params:
-                st.warning("❗ No parameters found in the URL. SQL Injection Scan Not Applicable.")
-                st.info("Example of parameter: https://example.com/item.php?id=1  → id is parameter")
+                st.warning("❗ No parameters found in the URL. SQL Injection Scan is NOT applicable.")
+                st.info("Hint: Add something like `?id=1` at the end of the URL to test.")
             else:
-                param = params[0]
+                param = params[0]  # first parameter by default
                 st.info(f"Target parameter detected: **{param}**")
 
-                baseline_resp, baseline_time, err = send_request(url, timeout)
+                # Baseline request
+                with st.spinner("Sending baseline request..."):
+                    baseline_resp, baseline_time, err = send_request(url)
 
                 if baseline_resp is None:
                     st.error(f"Request failed: {err}")
                 else:
                     baseline_len = len(baseline_resp.text)
-                    st.success(f"Baseline Response: HTTP {baseline_resp.status_code} | Size: {baseline_len} bytes")
+                    st.success(
+                        f"Baseline response received: HTTP {baseline_resp.status_code} | "
+                        f"Time: {baseline_time:.2f}s | Size: {baseline_len} bytes"
+                    )
 
                     results = []
-                    for payload in SQLI_PAYLOADS:
-                        test_value = payload
-                        attack_url = build_url(url, param, test_value)
 
-                        resp, t, error = send_request(attack_url, timeout)
+                    for payload in SQLI_PAYLOADS:
+                        attack_url = build_url(url, param, payload)
+
+                        with st.spinner(f"Testing payload: `{payload}`"):
+                            resp, elapsed, error = send_request(attack_url)
 
                         if resp is None:
-                            results.append([payload, "Failed", error])
-                        else:
-                            suspicious = False
-                            reason = ""
+                            results.append(
+                                {
+                                    "Payload": payload,
+                                    "HTTP Status": "Request Failed",
+                                    "Suspicious": "N/A",
+                                    "Indicators": error or "No response",
+                                }
+                            )
+                            continue
 
-                            length_diff = abs(len(resp.text) - baseline_len)
-                            if length_diff > 100:
-                                suspicious = True
-                                reason += f"Response size changed by {length_diff} bytes. "
+                        suspicious = False
+                        reasons = []
 
-                            if any(e in resp.text.lower() for e in ERROR_KEYWORDS):
-                                suspicious = True
-                                reason += "SQL error keyword found. "
+                        # Check response length difference
+                        length_diff = abs(len(resp.text) - baseline_len)
+                        if length_diff > 100:
+                            suspicious = True
+                            reasons.append(f"Response size changed by {length_diff} bytes")
 
-                            results.append([
-                                payload,
-                                resp.status_code,
-                                "YES" if suspicious else "NO",
-                                reason if reason else "No indicators"
-                            ])
+                        # Check for SQL error keywords
+                        body_lower = resp.text.lower()
+                        if any(keyword in body_lower for keyword in ERROR_KEYWORDS):
+                            suspicious = True
+                            reasons.append("SQL error-like keyword found in response")
+
+                        results.append(
+                            {
+                                "Payload": payload,
+                                "HTTP Status": resp.status_code,
+                                "Suspicious": "YES" if suspicious else "NO",
+                                "Indicators": "; ".join(reasons) if reasons else "No strong indicators",
+                            }
+                        )
 
                     st.subheader("Scan Results")
                     st.table(results)
 
-                    if any(r[2] == "YES" for r in results):
-                        st.error("🚨 Possible SQL Injection Indicators Found — Manual verification recommended.")
+                    any_suspicious = any(r["Suspicious"] == "YES" for r in results)
+                    if any_suspicious:
+                        st.error(
+                            "🚨 Potential SQL Injection indicators detected. "
+                            "Manual security verification is strongly recommended."
+                        )
                     else:
-                        st.success("✅ No strong SQL injection indicators detected.")
+                        st.success(
+                            "✅ Scan completed. No strong SQL Injection indicators detected "
+                            "for the tested parameter based on these checks."
+                        )
 
-# =============================================
-# ============== Header Scan ==================
-# =============================================
+# =========================================================
+#                  SECURITY HEADER SCAN
+# =========================================================
 
 elif mode == "Security Header Scan":
-
     st.subheader("Security Header Analysis")
 
-    url = st.text_input("Enter website URL (example: https://amazon.in)")
+    url = st.text_input(
+        "Enter website URL",
+        placeholder="https://example.com",
+    )
 
     if st.button("Check Headers"):
+        if not url:
+            st.error("Please enter a valid URL.")
+        else:
+            with st.spinner("Fetching headers..."):
+                try:
+                    resp = requests.get(url, timeout=DEFAULT_TIMEOUT, verify=False)
+                except Exception as e:
+                    st.error(f"Error while connecting to the target: {e}")
+                else:
+                    st.success(f"Response received: HTTP {resp.status_code}")
 
-        try:
-            resp = requests.get(url, timeout=10, verify=False)
-            st.write(f"Status: {resp.status_code}")
+                    st.write(f"**Server:** {resp.headers.get('Server', 'Unknown')}")
+                    st.write(f"**X-Powered-By:** {resp.headers.get('X-Powered-By', 'Unknown')}")
 
-            important_headers = [
-                "Content-Security-Policy",
-                "X-Frame-Options",
-                "X-Content-Type-Options",
-                "Strict-Transport-Security",
-                "Referrer-Policy",
-            ]
+                    important_headers = [
+                        "Content-Security-Policy",
+                        "X-Frame-Options",
+                        "X-Content-Type-Options",
+                        "Strict-Transport-Security",
+                        "Referrer-Policy",
+                    ]
 
-            header_result = []
-            for h in important_headers:
-                header_result.append([h, "Present" if h in resp.headers else "Missing"])
+                    header_result = []
+                    for h in important_headers:
+                        val = resp.headers.get(h)
+                        header_result.append(
+                            {
+                                "Header": h,
+                                "Status": "Present" if val else "Missing",
+                                "Value": val if val else "-",
+                            }
+                        )
 
-            st.table(header_result)
+                    st.subheader("Important Security Headers")
+                    st.table(header_result)
 
-        except Exception as e:
-            st.error(f"Error: {e}")
+                    missing = [h["Header"] for h in header_result if h["Status"] == "Missing"]
+                    if missing:
+                        st.warning(
+                            "Some recommended security headers are missing: "
+                            + ", ".join(missing)
+                        )
+                    else:
+                        st.success("All key security headers are present. Good security configuration!")
 
-# =============================================
-# =============== About ========================
-# =============================================
+# =========================================================
+#                        ABOUT
+# =========================================================
 
 else:
     st.subheader("About SQL Sentinel / CyberscanX")
-    st.write("""
-    CyberscanX is a lightweight automated web vulnerability scanner built for educational purposes.
-    It performs SQL injection indicator testing and security header analysis.
+    st.markdown(
+        """
+        **SQL Sentinel** is the mini-project title, and **CyberscanX** is the web-based tool
+        developed under this project.
 
-    **Legal Disclaimer:** Use only on websites you own or have written permission to test.
-    Unauthorized testing is illegal.
-    """)
+        **Purpose**
+
+        - Detect possible SQL Injection indicators in web applications using automated payload testing.  
+        - Analyse HTTP responses to find suspicious patterns and SQL error messages.  
+        - Review important security headers and highlight missing protections.  
+
+        **Key Notes**
+
+        - This tool is designed for **learning and demonstration**.
+        - It performs **lightweight, non-destructive checks** only.
+        - Use it **only** on websites you own or have explicit permission to test.  
+          Unauthorized security testing may be illegal.
+
+        **Developer:** Lord Naveen 😎  
+        """
+    )
