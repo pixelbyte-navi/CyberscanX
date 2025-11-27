@@ -1,4 +1,4 @@
 streamlit
+validators
+python-whois
 requests
-beautifulsoup4
-urllib3
